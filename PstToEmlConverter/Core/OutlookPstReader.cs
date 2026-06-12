@@ -1,5 +1,7 @@
 ﻿using Outlook = Microsoft.Office.Interop.Outlook;
 using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -8,6 +10,188 @@ namespace PstToEmlConverter.Core
 {
     public sealed class OutlookPstReader : IPstReader
     {
+        // ----- MAPI property tags (PropertyAccessor schema URLs) ---------------------
+        private const string PR_SMTP_ADDRESS                   = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F";
+        private const string PR_SENDER_SMTP_ADDRESS            = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F";
+        private const string PR_SENT_REPRESENTING_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x5D02001F";
+        private const string PR_INTERNET_MESSAGE_ID            = "http://schemas.microsoft.com/mapi/proptag/0x1035001F";
+        // Optional: full original header block for messages received over SMTP.
+        private const string PR_TRANSPORT_MESSAGE_HEADERS      = "http://schemas.microsoft.com/mapi/proptag/0x007D001F";
+
+        // ----- PropertyAccessor helper ----------------------------------------------
+        // GetProperty THROWS when the property isn't set, so always wrap it.
+        private static string? TryGetProperty(dynamic comObject, string schemaTag)
+        {
+            object? pa = null;
+            try
+            {
+                pa = comObject.PropertyAccessor;
+                object val = ((dynamic)pa).GetProperty(schemaTag);
+                return val as string;
+            }
+            catch { return null; }
+            finally { ReleaseCom(pa); }
+        }
+
+        // ----- Sender -> SMTP --------------------------------------------------------
+        private static string ResolveSenderSmtp(Outlook.MailItem mail)
+        {
+            // 1) Direct SMTP MAPI properties (set on most modern items).
+            string? smtp = TryGetProperty(mail, PR_SENDER_SMTP_ADDRESS)
+                        ?? TryGetProperty(mail, PR_SENT_REPRESENTING_SMTP_ADDRESS);
+            if (!string.IsNullOrWhiteSpace(smtp)) return smtp!;
+
+            // 2) Exchange sender -> resolve through the address book.
+            try
+            {
+                if (string.Equals(SafeGet(() => mail.SenderEmailType), "EX", StringComparison.OrdinalIgnoreCase))
+                {
+                    Outlook.AddressEntry sender = null!;
+                    try
+                    {
+                        sender = mail.Sender;
+                        if (sender != null)
+                        {
+                            Outlook.ExchangeUser ex = null!;
+                            try
+                            {
+                                ex = sender.GetExchangeUser();
+                                if (ex != null && !string.IsNullOrWhiteSpace(ex.PrimarySmtpAddress))
+                                    return ex.PrimarySmtpAddress;
+                            }
+                            catch { }
+                            finally { ReleaseCom(ex); }
+
+                            string? viaProp = TryGetProperty(sender, PR_SMTP_ADDRESS);
+                            if (!string.IsNullOrWhiteSpace(viaProp)) return viaProp!;
+                        }
+                    }
+                    finally { ReleaseCom(sender); }
+                }
+            }
+            catch { }
+
+            // 3) Last resort: whatever SenderEmailAddress / SenderName give us
+            //    (may be the EX address, but better than nothing).
+            return SafeGet(() => mail.SenderEmailAddress) ?? SafeGet(() => mail.SenderName) ?? "";
+        }
+
+        // ----- Recipients -> SMTP ----------------------------------------------------
+        private static string ResolveRecipients(Outlook.MailItem mail, Outlook.OlMailRecipientType type)
+        {
+            var list = new List<string>();
+            Outlook.Recipients recips = null!;
+            try
+            {
+                recips = mail.Recipients;
+                for (int i = 1; i <= recips.Count; i++)
+                {
+                    Outlook.Recipient r = null!;
+                    try
+                    {
+                        r = recips[i];
+                        if (r.Type != (int)type) continue;
+
+                        string display = r.Name ?? "";
+                        string smtp = ResolveRecipientSmtp(r);
+                        list.Add(FormatAddress(display, smtp));
+                    }
+                    catch { }
+                    finally { ReleaseCom(r); }
+                }
+            }
+            catch { }
+            finally { ReleaseCom(recips); }
+
+            return string.Join(", ", list);
+        }
+
+        private static string ResolveRecipientSmtp(Outlook.Recipient r)
+        {
+            // 1) PR_SMTP_ADDRESS on the recipient row covers most stored recipients.
+            string? smtp = TryGetProperty(r, PR_SMTP_ADDRESS);
+            if (!string.IsNullOrWhiteSpace(smtp)) return smtp!;
+
+            // 2) Resolve via the AddressEntry.
+            Outlook.AddressEntry ae = null!;
+            try
+            {
+                ae = r.AddressEntry;
+                if (ae != null)
+                {
+                    if (string.Equals(ae.Type, "EX", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Outlook.ExchangeUser ex = null!;
+                        try
+                        {
+                            ex = ae.GetExchangeUser();
+                            if (ex != null && !string.IsNullOrWhiteSpace(ex.PrimarySmtpAddress))
+                                return ex.PrimarySmtpAddress;
+                        }
+                        catch { }
+                        finally { ReleaseCom(ex); }
+
+                        string? viaProp = TryGetProperty(ae, PR_SMTP_ADDRESS);
+                        if (!string.IsNullOrWhiteSpace(viaProp)) return viaProp!;
+                    }
+                    else
+                    {
+                        // SMTP / other types: Address is already usable.
+                        string addr = SafeGet(() => ae.Address) ?? "";
+                        if (!string.IsNullOrWhiteSpace(addr)) return addr;
+                    }
+                }
+            }
+            catch { }
+            finally { ReleaseCom(ae); }
+
+            return "";
+        }
+
+        // ----- Build a proper "Display Name <smtp>" header value ---------------------
+        // Encodes ONLY the display-name part (RFC 2047). The address must stay literal.
+        private static string FormatAddress(string name, string smtp)
+        {
+            if (string.IsNullOrWhiteSpace(smtp))
+                return FormatDisplayName(name ?? "");
+            if (string.IsNullOrWhiteSpace(name) || string.Equals(name, smtp, StringComparison.OrdinalIgnoreCase))
+                return smtp;
+            return $"{FormatDisplayName(name)} <{smtp}>";
+        }
+
+        // Render the display-name part so it's safe in an address header.
+        // Non-ASCII -> RFC 2047 encoded-word (already self-delimiting). ASCII names that
+        // contain RFC 5322 "specials" (most importantly ',' and ';', which are address-
+        // list separators) must be wrapped in a quoted-string, else "Cohen, Or <x>" is
+        // mis-parsed as two recipients.
+        private static string FormatDisplayName(string name)
+        {
+            foreach (char c in name)
+                if (c > 127) return EncodeHeader(name);
+
+            if (name.IndexOfAny(new[] { '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '.', '[', ']' }) >= 0)
+                return "\"" + name.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+
+            return name;
+        }
+
+        // ----- Sent date resolution --------------------------------------------------
+        // SentOn returns Outlook's null-date sentinel (01 Jan 4501) rather than null for
+        // items with no submit time, so a plain "?? DateTime.Now" never catches it.
+        // Fall back: SentOn -> ReceivedTime -> now, accepting only plausible dates.
+        private static DateTime ResolveSentDate(Outlook.MailItem mail)
+        {
+            DateTime? sent = SafeGet(() => mail.SentOn);
+            if (sent.HasValue && IsPlausibleDate(sent.Value)) return sent.Value;
+
+            DateTime? received = SafeGet(() => mail.ReceivedTime);
+            if (received.HasValue && IsPlausibleDate(received.Value)) return received.Value;
+
+            return DateTime.Now;
+        }
+
+        private static bool IsPlausibleDate(DateTime dt) => dt.Year > 1900 && dt.Year < 4000;
+
         public void ConvertPstToEml(string pstPath, string outputDir, ConversionOptions options, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
@@ -104,7 +288,7 @@ namespace PstToEmlConverter.Core
             }
 
             // 1) Export items in this folder (using Items.GetFirst/GetNext)
-            int seen = 0, saved = 0, failed = 0;
+            int seen = 0, saved = 0, failed = 0, skipped = 0;
 
             Outlook.Items items = null!;
             try
@@ -142,34 +326,23 @@ namespace PstToEmlConverter.Core
                             if (subject.Length > 80) subject = subject.Substring(0, 80);
 
                             string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmssfff");
-                            string path = Path.Combine(folderOutDir, $"{stamp}_{subject}.eml");
 
-                            dynamic itemDyn = cur;
-
-                            // 1) Save to MSG (works across Outlook versions)
-                            string msgPath = Path.Combine(folderOutDir, $"{stamp}_{subject}.msg");
                             // Try cast to MailItem for rich fields
                             var mail = cur as Outlook.MailItem;
                             if (mail != null)
-                            if (mail != null)
                             {
-                                string emlPath = Path.Combine(folderOutDir, $"{stamp}_{subject}.eml");
+                                // seen is unique per item this run, so the filename can't
+                                // collide with another same-subject item in the same ms.
+                                string emlPath = Path.Combine(folderOutDir, $"{stamp}_{seen:D4}_{subject}.eml");
                                 WriteEmlFromMailItem(mail, emlPath);
                                 saved++;
                             }
-                            // 2) Re-open and save as EML (102 may work on reopened MailItem)
-                            dynamic reopened = ns.OpenSharedItem(msgPath);
-                            try
+                            else
                             {
-                                // overwrite EML path
-                                reopened.SaveAs(path, 102); // 102 = RFC822/EML
+                                // Non-mail item (meeting, contact, task, report) — intentionally
+                                // not exported; counted separately from real failures.
+                                skipped++;
                             }
-                            finally
-                            {
-                                ReleaseCom(reopened);
-                            }
-
-                            saved++;
                         }
                         catch (Exception ex)
                         {
@@ -194,7 +367,7 @@ namespace PstToEmlConverter.Core
                 ReleaseCom(items);
             }
 
-            DebugLine(rootOutDir, $"  RESULT: seen={seen}, saved={saved}, failed={failed}");
+            DebugLine(rootOutDir, $"  RESULT: seen={seen}, saved={saved}, skipped={skipped}, failed={failed}");
 
             // 2) Recurse into subfolders
             Outlook.Folders subFolders = null!;
@@ -255,14 +428,21 @@ namespace PstToEmlConverter.Core
             try { text = mail.Body ?? ""; } catch { }
 
             // Headers
-            string from = SafeGet(() => mail.SenderEmailAddress) ?? SafeGet(() => mail.SenderName) ?? "";
-            string to = SafeGet(() => mail.To) ?? "";
-            string cc = SafeGet(() => mail.CC) ?? "";
-            string subject = SafeGet(() => mail.Subject) ?? "";
-            DateTime sent = SafeGet(() => mail.SentOn) ?? DateTime.Now;
+            string fromSmtp = ResolveSenderSmtp(mail);
+            string fromName = SafeGet(() => mail.SenderName) ?? "";
+            string from     = FormatAddress(fromName, fromSmtp);          // already encoded
 
-            // Basic RFC 5322 date format
-            string dateHeader = sent.ToString("ddd, dd MMM yyyy HH:mm:ss zzz");
+            string to = ResolveRecipients(mail, Outlook.OlMailRecipientType.olTo);   // already encoded
+            string cc = ResolveRecipients(mail, Outlook.OlMailRecipientType.olCC);   // already encoded
+
+            string subject   = SafeGet(() => mail.Subject) ?? "";
+            string messageId = TryGetProperty(mail, PR_INTERNET_MESSAGE_ID) ?? "";
+            DateTime sent    = ResolveSentDate(mail);
+
+            // RFC 5322 date: English day/month tokens (invariant culture, never the OS
+            // locale) and a numeric zone like +0300 (no colon).
+            string offset = sent.ToString("zzz", CultureInfo.InvariantCulture).Replace(":", "");
+            string dateHeader = sent.ToString("ddd, dd MMM yyyy HH:mm:ss ", CultureInfo.InvariantCulture) + offset;
 
             // Attachments?
             int attCount = 0;
@@ -271,10 +451,11 @@ namespace PstToEmlConverter.Core
             var sb = new System.Text.StringBuilder();
 
             sb.AppendLine($"Date: {dateHeader}");
-            if (!string.IsNullOrWhiteSpace(from)) sb.AppendLine($"From: {EncodeHeader(from)}");
-            if (!string.IsNullOrWhiteSpace(to)) sb.AppendLine($"To: {EncodeHeader(to)}");
-            if (!string.IsNullOrWhiteSpace(cc)) sb.AppendLine($"Cc: {EncodeHeader(cc)}");
+            if (!string.IsNullOrWhiteSpace(from))      sb.AppendLine($"From: {from}");   // no EncodeHeader
+            if (!string.IsNullOrWhiteSpace(to))        sb.AppendLine($"To: {to}");       // no EncodeHeader
+            if (!string.IsNullOrWhiteSpace(cc))        sb.AppendLine($"Cc: {cc}");       // no EncodeHeader
             sb.AppendLine($"Subject: {EncodeHeader(subject)}");
+            if (!string.IsNullOrWhiteSpace(messageId)) sb.AppendLine($"Message-ID: {messageId}");
             sb.AppendLine("MIME-Version: 1.0");
 
             if (attCount <= 0)
