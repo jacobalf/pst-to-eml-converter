@@ -1,0 +1,12 @@
+PstToEmlConverter — Important
+
+This application converts Outlook PST archives into individual .eml files.
+
+REQUIREMENT: Desktop Microsoft Outlook must be installed on this computer.
+PstToEmlConverter works by driving Outlook through COM automation; it is not a
+standalone PST parser. If desktop Outlook (the classic Win32 app, not the
+"new Outlook" / web app) is not installed, the converter will not run.
+
+No internet connection is required for the conversion itself.
+
+Click Next to continue with the installation.
