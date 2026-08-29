@@ -11,12 +11,15 @@ namespace PstToEmlConverter.Core
     public sealed class OutlookPstReader : IPstReader
     {
         // ----- MAPI property tags (PropertyAccessor schema URLs) ---------------------
-        private const string PR_SMTP_ADDRESS                   = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F";
-        private const string PR_SENDER_SMTP_ADDRESS            = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F";
-        private const string PR_SENT_REPRESENTING_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x5D02001F";
-        private const string PR_INTERNET_MESSAGE_ID            = "http://schemas.microsoft.com/mapi/proptag/0x1035001F";
+        private const string PR_SMTP_ADDRESS                    = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F";
+        private const string PR_SENDER_SMTP_ADDRESS             = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F";
+        private const string PR_SENT_REPRESENTING_SMTP_ADDRESS  = "http://schemas.microsoft.com/mapi/proptag/0x5D02001F";
+        private const string PR_INTERNET_MESSAGE_ID             = "http://schemas.microsoft.com/mapi/proptag/0x1035001F";
         // Optional: full original header block for messages received over SMTP.
-        private const string PR_TRANSPORT_MESSAGE_HEADERS      = "http://schemas.microsoft.com/mapi/proptag/0x007D001F";
+        private const string PR_TRANSPORT_MESSAGE_HEADERS       = "http://schemas.microsoft.com/mapi/proptag/0x007D001F";
+        // Date/time properties (more reliable than COM properties in some cases)
+        private const string PR_CLIENT_SUBMIT_TIME              = "http://schemas.microsoft.com/mapi/proptag/0x00390040"; // SentOn
+        private const string PR_MESSAGE_DELIVERY_TIME           = "http://schemas.microsoft.com/mapi/proptag/0x0E060040"; // ReceivedTime
 
         // ----- PropertyAccessor helper ----------------------------------------------
         // GetProperty THROWS when the property isn't set, so always wrap it.
@@ -28,6 +31,26 @@ namespace PstToEmlConverter.Core
                 pa = comObject.PropertyAccessor;
                 object val = ((dynamic)pa).GetProperty(schemaTag);
                 return val as string;
+            }
+            catch { return null; }
+            finally { ReleaseCom(pa); }
+        }
+
+        // Get DateTime from PropertyAccessor (returns DateTime? for MAPI PT_SYSTIME properties)
+        private static DateTime? TryGetPropertyDateTime(dynamic comObject, string schemaTag)
+        {
+            object? pa = null;
+            try
+            {
+                pa = comObject.PropertyAccessor;
+                object val = ((dynamic)pa).GetProperty(schemaTag);
+                if (val is DateTime dt) return dt;
+                // COM can return boxed DateTime or other types; try conversion
+                if (val != null)
+                {
+                    try { return Convert.ToDateTime(val); } catch { }
+                }
+                return null;
             }
             catch { return null; }
             finally { ReleaseCom(pa); }
@@ -178,13 +201,23 @@ namespace PstToEmlConverter.Core
         // ----- Sent date resolution --------------------------------------------------
         // SentOn returns Outlook's null-date sentinel (01 Jan 4501) rather than null for
         // items with no submit time, so a plain "?? DateTime.Now" never catches it.
-        // Fall back: SentOn -> ReceivedTime -> now, accepting only plausible dates.
+        // Fall back: PR_CLIENT_SUBMIT_TIME (SentOn) -> SentOn -> PR_MESSAGE_DELIVERY_TIME (ReceivedTime) -> ReceivedTime -> now
         private static DateTime ResolveSentDate(Outlook.MailItem mail)
         {
-            DateTime? sent = SafeGet(() => mail.SentOn);
+            // Try MAPI property first (more reliable)
+            DateTime? sent = TryGetPropertyDateTime(mail, PR_CLIENT_SUBMIT_TIME);
             if (sent.HasValue && IsPlausibleDate(sent.Value)) return sent.Value;
 
-            DateTime? received = SafeGet(() => mail.ReceivedTime);
+            // Fall back to COM property
+            sent = SafeGet(() => mail.SentOn);
+            if (sent.HasValue && IsPlausibleDate(sent.Value)) return sent.Value;
+
+            // Try MAPI property for received time
+            DateTime? received = TryGetPropertyDateTime(mail, PR_MESSAGE_DELIVERY_TIME);
+            if (received.HasValue && IsPlausibleDate(received.Value)) return received.Value;
+
+            // Fall back to COM property
+            received = SafeGet(() => mail.ReceivedTime);
             if (received.HasValue && IsPlausibleDate(received.Value)) return received.Value;
 
             return DateTime.Now;
@@ -438,11 +471,25 @@ namespace PstToEmlConverter.Core
             string subject   = SafeGet(() => mail.Subject) ?? "";
             string messageId = TryGetProperty(mail, PR_INTERNET_MESSAGE_ID) ?? "";
             DateTime sent    = ResolveSentDate(mail);
+            // Preserve received time separately to add Received header (fixes date received preservation)
+            // Try MAPI property first (more reliable), then fall back to COM property
+            DateTime? received = TryGetPropertyDateTime(mail, PR_MESSAGE_DELIVERY_TIME);
+            if (!received.HasValue || !IsPlausibleDate(received.Value))
+                received = SafeGet(() => mail.ReceivedTime);
 
             // RFC 5322 date: English day/month tokens (invariant culture, never the OS
             // locale) and a numeric zone like +0300 (no colon).
             string offset = sent.ToString("zzz", CultureInfo.InvariantCulture).Replace(":", "");
             string dateHeader = sent.ToString("ddd, dd MMM yyyy HH:mm:ss ", CultureInfo.InvariantCulture) + offset;
+
+            // Add Received header with original received timestamp if available
+            string? receivedHeader = null;
+            if (received.HasValue && IsPlausibleDate(received.Value))
+            {
+                string roffset = received.Value.ToString("zzz", CultureInfo.InvariantCulture).Replace(":", "");
+                string rdate = received.Value.ToString("ddd, dd MMM yyyy HH:mm:ss ", CultureInfo.InvariantCulture) + roffset;
+                receivedHeader = $"Received: ; {rdate}";
+            }
 
             // Attachments?
             int attCount = 0;
@@ -451,6 +498,8 @@ namespace PstToEmlConverter.Core
             var sb = new System.Text.StringBuilder();
 
             sb.AppendLine($"Date: {dateHeader}");
+            // Write Received header if we have it (preserves original receive time)
+            if (receivedHeader != null) sb.AppendLine(receivedHeader);
             if (!string.IsNullOrWhiteSpace(from))      sb.AppendLine($"From: {from}");   // no EncodeHeader
             if (!string.IsNullOrWhiteSpace(to))        sb.AppendLine($"To: {to}");       // no EncodeHeader
             if (!string.IsNullOrWhiteSpace(cc))        sb.AppendLine($"Cc: {cc}");       // no EncodeHeader
