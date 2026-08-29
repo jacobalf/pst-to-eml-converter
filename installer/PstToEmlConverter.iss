@@ -1,9 +1,9 @@
 ; Inno Setup script for PstToEmlConverter
-; Self-contained .NET 10 WPF app (win-x64). Requires desktop Microsoft Outlook at runtime.
+; Self-contained .NET 8 WPF app (win-x64). Requires desktop Microsoft Outlook at runtime.
 ; Compile with: ISCC.exe PstToEmlConverter.iss
 
 #define MyAppName "PstToEmlConverter"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "kgounaris"
 #define MyAppExeName "PstToEmlConverter.exe"
 
@@ -38,7 +38,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; Entire published folder, including all subfolders.
-Source: "..\PstToEmlConverter\bin\Release\net10.0-windows\publish\win-x64\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "..\PstToEmlConverter\bin\Release\net8.0-windows\publish\win-x64\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
